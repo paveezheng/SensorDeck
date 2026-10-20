@@ -4,6 +4,7 @@ import SwiftUI
 
 struct DashboardView: View {
     @Environment(ThermalStore.self) private var store
+    @Environment(DeckMode.self) private var deck
 
     var body: some View {
         ScrollView {
@@ -21,20 +22,54 @@ struct DashboardView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(store.reading.batteryTemperatureText)
-                .font(.system(size: 72, weight: .medium, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(Color(red: 1.0, green: 0.62, blue: 0.30))
-                .minimumScaleFactor(0.5)
-                .lineLimit(1)
-                .contentTransition(.numericText())
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 8) {
+                // 没读到值时 "—" 在 72pt 下是一条大横杠，缩掉一半才像占位符。
+                let hasTemperature = store.reading.batteryCelsius != nil
+                Text(store.reading.batteryTemperatureText)
+                    .font(.system(size: hasTemperature ? 72 : 34, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(
+                        hasTemperature
+                            ? Color(red: 1.0, green: 0.62, blue: 0.30)
+                            : Color.secondary
+                    )
+                    .minimumScaleFactor(0.5)
+                    .lineLimit(1)
+                    .contentTransition(.numericText())
 
-            Text(store.reading.batteryCaption)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+                Text(store.reading.batteryCaption)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            awakeToggle
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// 竖屏常亮开关。横屏会自动常亮，跟这个开关无关。
+    private var awakeToggle: some View {
+        Button {
+            deck.keepAwakeInPortrait.toggle()
+        } label: {
+            Label(
+                deck.keepAwakeInPortrait ? "常亮" : "自动息屏",
+                systemImage: deck.keepAwakeInPortrait ? "sun.max.fill" : "moon.zzz"
+            )
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .foregroundStyle(
+                deck.keepAwakeInPortrait
+                    ? Color(red: 1.0, green: 0.62, blue: 0.30)
+                    : Color.secondary
+            )
+            .background(Color.white.opacity(deck.keepAwakeInPortrait ? 0.12 : 0.06))
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 6)
     }
 
     private var batteryBlock: some View {
@@ -98,6 +133,7 @@ struct DashboardView: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Updated \(timeText(store.reading.sampledAt))")
             Text("Sample interval 1s")
+            Text("横屏进入 Deck 常亮模式")
             Text("Personal use only")
         }
         .font(.caption2)
@@ -127,5 +163,6 @@ struct DashboardView: View {
 #Preview {
     DashboardView()
         .environment(ThermalStore.preview)
+        .environment(DeckMode())
         .preferredColorScheme(.dark)
 }

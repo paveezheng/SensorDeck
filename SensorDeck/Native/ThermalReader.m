@@ -326,6 +326,29 @@ static BOOL SDNameIsCurrent(NSString *name) {
         || [n containsString:@"ich"] || [n containsString:@"charger i"];
 }
 
+// 从 "Charger VQ1u" / "Charger IQ0B" / "PMU VP0u" 里取出电轨标识 "Q1" / "Q0" / "P0"。
+// V/I/W 只是量纲前缀，后面的 Q<n> / P<n> 才标识是哪一条电轨。
+// 这台机器上 Q0 是电池侧（~4V），Q1 是输入侧（~9.8V），
+// 只有同一条轨上的 V 和 I 相乘才对应真实电路。
+static NSString *SDRailID(NSString *name) {
+    if (![name isKindOfClass:[NSString class]]) {
+        return nil;
+    }
+    NSString *upper = name.uppercaseString;
+    for (NSUInteger i = 0; i + 2 < upper.length; i++) {
+        unichar dimension = [upper characterAtIndex:i];
+        if (dimension != 'V' && dimension != 'I' && dimension != 'W') {
+            continue;
+        }
+        unichar group = [upper characterAtIndex:i + 1];
+        unichar index = [upper characterAtIndex:i + 2];
+        if ((group == 'Q' || group == 'P') && index >= '0' && index <= '9') {
+            return [NSString stringWithFormat:@"%C%C", group, index];
+        }
+    }
+    return nil;
+}
+
 // Modern iPhone HID names look like "Charger VQ0u" / "Charger IQ0u" / "PMU VP0u",
 // not the older "vbat" / "vbus" strings.
 static NSDictionary *SDPickChargerVoltage(NSArray<NSDictionary *> *rows) {
@@ -414,20 +437,30 @@ static NSDictionary *SDPickChargerCurrent(NSArray<NSDictionary *> *rows) {
             continue;
         }
         double amps = fabs(ampsNumber.doubleValue);
-        if (amps < 0.02 || amps > 6.5) {
+        if (amps > 6.5) {
             continue;
         }
-        NSString *n = name.lowercaseString;
-        double score = amps;
-        if ([n containsString:@"iq0u"]) {
-            score += 20;
+        // 名字加分只给"确实在动"的那一路。
+        // 这台机器上 "Charger IQ0u" 常年读 0，真正带电流的是 "Charger IQ0B"；
+        // 无条件给 iq0u 加 20 分会让死的那路赢，A/W 就永远是 0.00。
+        //
+        // 反过来也不能直接把小电流整行丢掉：涓流充电真的会掉到 20mA 以下，
+        // 丢掉会让 A 和 W 一起闪没（power = V × I）。所以是"不加分"而不是"跳过"，
+        // 活跃的那一路即使这一秒读到 0.005 仍然靠自己的量级赢过其他归零的行。
+        double nameScore = 0;
+        if (amps >= 0.02) {
+            NSString *n = name.lowercaseString;
+            if ([n containsString:@"iq0u"]) {
+                nameScore += 20;
+            }
+            if ([n containsString:@"charger"]) {
+                nameScore += 10;
+            }
+            if ([n containsString:@"ibat"]) {
+                nameScore += 15;
+            }
         }
-        if ([n containsString:@"charger"]) {
-            score += 10;
-        }
-        if ([n containsString:@"ibat"]) {
-            score += 15;
-        }
+        double score = nameScore + amps;
         if (score > bestScore) {
             bestScore = score;
             best = row;
@@ -464,23 +497,39 @@ static NSDictionary *SDPickWattSensor(NSArray<NSDictionary *> *rows) {
     return best;
 }
 
+// 传感器集合会随充电方式变（有线 / MagSafe / Qi 暴露的轨不一样，数量也会 27↔28 跳），
+// 所以不是"只打一次"，而是"名字集合变了就再打一次"。值一直在变，只看名字，否则 1Hz 刷屏。
 static void SDLogHIDOnce(NSString *kind, NSArray<NSDictionary *> *rows) {
-    static NSMutableSet<NSString *> *logged;
+    static NSMutableDictionary<NSString *, NSString *> *signatures;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        logged = [NSMutableSet set];
+        signatures = [NSMutableDictionary dictionary];
     });
-    if ([logged containsObject:kind] || rows.count == 0) {
+    if (rows.count == 0) {
         return;
     }
-    [logged addObject:kind];
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSDictionary *row in rows) {
+        NSString *name = row[@"name"];
+        if ([name isKindOfClass:[NSString class]]) {
+            [names addObject:name];
+        }
+    }
+    NSString *signature = [[names sortedArrayUsingSelector:@selector(compare:)]
+        componentsJoinedByString:@"|"];
+    if ([signatures[kind] isEqualToString:signature]) {
+        return;
+    }
+    signatures[kind] = signature;
+
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
     NSUInteger limit = MIN((NSUInteger)24, rows.count);
     for (NSUInteger i = 0; i < limit; i++) {
         NSDictionary *row = rows[i];
         [parts addObject:[NSString stringWithFormat:@"%@=%g", row[@"name"], [row[@"value"] doubleValue]]];
     }
-    NSLog(@"[SensorDeck] HID %@: %@", kind, [parts componentsJoinedByString:@", "]);
+    NSLog(@"[SensorDeck] HID %@ (%lu): %@",
+          kind, (unsigned long)rows.count, [parts componentsJoinedByString:@", "]);
 }
 
 #pragma mark - IORegistry power service
@@ -850,6 +899,41 @@ static NSNumber *SDReadCPUUsage(NSMutableString *diag, BOOL *restricted) {
         wattRow = SDPickWattSensor(hidAmps);
     }
 
+    if (!current && chargerI) {
+        current = SDAmpsFromRaw([chargerI[@"value"] doubleValue]);
+        currentSource = chargerI[@"name"];
+    }
+
+    // 先定电流，再在同一条电轨上找电压。
+    // 不这么做的话，某一帧 VQ1u（输入侧 9.8V）缺席就会静默退回 PMU VP0u（电池组 4.1V），
+    // 电压在两条轨之间来回跳，而 P=V*I 一会儿算输入功率一会儿是跨轨的无意义乘积。
+    NSString *currentRail = currentSource ? SDRailID(currentSource) : nil;
+    NSDictionary *railV = nil;
+    double railVolts = -1;
+    if (currentRail) {
+        for (NSDictionary *row in hidVolts) {
+            NSString *name = row[@"name"];
+            if (![name isKindOfClass:[NSString class]] || !SDNameIsVoltage(name)) {
+                continue;
+            }
+            NSString *rail = SDRailID(name);
+            if (!rail || ![rail isEqualToString:currentRail]) {
+                continue;
+            }
+            NSNumber *volts = SDVoltsFromRaw([row[@"value"] doubleValue]);
+            if (volts && volts.doubleValue > railVolts) {
+                railVolts = volts.doubleValue;
+                railV = row;
+            }
+        }
+    }
+
+    BOOL voltagePairsWithCurrent = NO;
+    if (!voltage && railV) {
+        voltage = @(railVolts);
+        voltageSource = railV[@"name"];
+        voltagePairsWithCurrent = YES;
+    }
     if (!voltage && chargerV) {
         voltage = SDVoltsFromRaw([chargerV[@"value"] doubleValue]);
         voltageSource = chargerV[@"name"];
@@ -858,17 +942,23 @@ static NSNumber *SDReadCPUUsage(NSMutableString *diag, BOOL *restricted) {
         voltage = SDVoltsFromRaw([packV[@"value"] doubleValue]);
         voltageSource = packV[@"name"];
     }
-    if (!current && chargerI) {
-        current = SDAmpsFromRaw([chargerI[@"value"] doubleValue]);
-        currentSource = chargerI[@"name"];
+
+    // 只有 V 和 I 在同一条电轨上才算功耗。跨轨相乘（例如输入侧电压 × 电池侧电流）
+    // 得到的数看着很合理，但不对应任何真实电路，宁可显示 —。
+    NSNumber *power = nil;
+    if (voltage && current && voltagePairsWithCurrent) {
+        power = @(voltage.doubleValue * current.doubleValue);
+        [diag appendFormat:@"P=V*I on rail %@; ", currentRail];
+    } else if (voltage && current) {
+        [diag appendFormat:@"P skipped: V(%@) and I(%@) on different rails; ",
+                           voltageSource, currentSource];
     }
 
-    NSNumber *power = nil;
-    if (voltage && current) {
-        power = @(voltage.doubleValue * current.doubleValue);
-    }
+    // WQ0u 不是瞬时功率：实测它每秒涨约 1.5 然后在 ~14 处回绕归零（锯齿波），
+    // 是累积量或滚动寄存器。绝对不能拿它当瓦特显示，只留作诊断。
     if (wattRow) {
-        [diag appendFormat:@"HID watts %@=%g; ", wattRow[@"name"], [wattRow[@"value"] doubleValue]];
+        [diag appendFormat:@"HID %@=%g (counter, not watts); ",
+                           wattRow[@"name"], [wattRow[@"value"] doubleValue]];
     }
     if (packV && chargerV) {
         NSNumber *packVolts = SDVoltsFromRaw([packV[@"value"] doubleValue]);
